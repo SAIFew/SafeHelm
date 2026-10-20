@@ -8,6 +8,13 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
     <application android:label="SafeHelm" android:name="${applicationName}">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
@@ -16,6 +23,12 @@
             </intent-filter>
             <meta-data android:name="io.flutter.embedding.android.NormalTheme" android:resource="@style/NormalTheme"/>
         </activity>
+
+        <service
+            android:name=".SafeHelmForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
         <meta-data android:name="flutterEmbedding" android:value="2"/>
     </application>
 </manifest>

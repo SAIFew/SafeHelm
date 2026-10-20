@@ -1,445 +1,309 @@
 #include <Arduino.h>
-#include <NimBLEDevice.h>
-#include <ArduinoJson.h>
+#include <Preferences.h>
+#include "Config.h"
+#include "SensorMonitor.h"
+#include "BleServer.h"
 
 // ============================================================
-// SAFEHELM ACCIDENT DETECTION FIRMWARE
+// SAFEHELM FIRMWARE (MODULAR V2)
 // ============================================================
 
-// -------------------------
-// Hardware pins
-// -------------------------
-static const int FSR1_PIN = 36;
-static const int FSR2_PIN = 39;
-static const int FSR3_PIN = 34;
+static SensorMonitor sensors;
+static BleServer ble;
+static Preferences prefs;
 
-static const int BUZZER_PIN = 12;
-static const int BUTTON_PIN = 13;
+// NVS Monotonic counters
+static uint32_t bootCount = 0;
+static uint32_t eventSeq = 0;
 
-// -------------------------
-// Accident configuration
-// -------------------------
-static const int FSR_THRESHOLD = 150;
+// State tracking
+enum class SystemState {
+  IDLE,
+  ACCIDENT_COUNTDOWN,
+  ACCIDENT_LOCKED
+};
 
-// Accident condition must remain valid for 300 ms
-static const unsigned long CONFIRM_TIME_MS = 300;
+static SystemState state = SystemState::IDLE;
+static unsigned long countdownStartTime = 0;
+static String activeEventId = "";
 
-// Rider has 15 seconds to cancel
-static const unsigned long CANCEL_TIME_MS = 15000;
+// Buzzer pattern generator (non-blocking)
+enum class BuzzerMode {
+  SILENT,
+  PULSING_COUNTDOWN,
+  CHIRP_CANCEL,
+  CHIRP_SOS
+};
 
-// -------------------------
-// BLE configuration
-// -------------------------
-static const char* DEVICE_NAME = "SAFEHELM-0001";
+static BuzzerMode buzzerMode = BuzzerMode::SILENT;
+static unsigned long buzzerPatternStart = 0;
 
-static const char* SERVICE_UUID =
-    "7a01a8b4-4b1e-4a7c-9be5-6a1e9484bb01";
+void setBuzzerMode(BuzzerMode mode) {
+  buzzerMode = mode;
+  buzzerPatternStart = millis();
+  if (mode == BuzzerMode::SILENT) {
+    digitalWrite(Config::BUZZER_PIN, LOW);
+  }
+}
 
-static const char* CHARACTERISTIC_UUID =
-    "7a01a8b4-4b1e-4a7c-9be5-6a1e9484bb02";
+void updateBuzzer() {
+  unsigned long now = millis();
+  unsigned long elapsed = now - buzzerPatternStart;
 
-NimBLECharacteristic* eventCharacteristic = nullptr;
+  switch (buzzerMode) {
+    case BuzzerMode::SILENT:
+      digitalWrite(Config::BUZZER_PIN, LOW);
+      break;
 
-// ============================================================
-// State
-// ============================================================
-
-// True while the 15-second cancellation window is running.
-bool accidentPending = false;
-
-// True after an accident has been sent/confirmed.
-// System will not trigger again until sensors are released.
-bool accidentLocked = false;
-
-// Time at which the 2-of-3 condition first became valid.
-unsigned long conditionStartTime = 0;
-
-// Time at which the 15-second cancellation window started.
-unsigned long accidentStartTime = 0;
-
-// Event ID of the current accident.
-String currentEventId = "";
-
-// ============================================================
-// Read FSR sensors
-// ============================================================
-
-int readTriggeredSensors(int& v1, int& v2, int& v3) {
-
-    v1 = analogRead(FSR1_PIN);
-    v2 = analogRead(FSR2_PIN);
-    v3 = analogRead(FSR3_PIN);
-
-    int triggered = 0;
-
-    if (v1 > FSR_THRESHOLD) {
-        triggered++;
+    case BuzzerMode::PULSING_COUNTDOWN: {
+      // Accelerating acoustic pulse as countdown approaches 0
+      // 0-5s elapsed: 1 Hz (100ms on, 900ms off)
+      // 5-10s elapsed: 2 Hz (100ms on, 400ms off)
+      // 10-15s elapsed: 4 Hz rapid urgent pulse (100ms on, 150ms off)
+      unsigned long cycle = 1000;
+      if (elapsed > 10000) {
+        cycle = 250;
+      } else if (elapsed > 5000) {
+        cycle = 500;
+      }
+      unsigned long phase = elapsed % cycle;
+      digitalWrite(Config::BUZZER_PIN, (phase < 100) ? HIGH : LOW);
+      break;
     }
 
-    if (v2 > FSR_THRESHOLD) {
-        triggered++;
+    case BuzzerMode::CHIRP_CANCEL: {
+      // Double chirp: 80ms ON, 60ms OFF, 80ms ON, then silent
+      if (elapsed < 80) {
+        digitalWrite(Config::BUZZER_PIN, HIGH);
+      } else if (elapsed < 140) {
+        digitalWrite(Config::BUZZER_PIN, LOW);
+      } else if (elapsed < 220) {
+        digitalWrite(Config::BUZZER_PIN, HIGH);
+      } else {
+        digitalWrite(Config::BUZZER_PIN, LOW);
+        buzzerMode = BuzzerMode::SILENT;
+      }
+      break;
     }
 
-    if (v3 > FSR_THRESHOLD) {
-        triggered++;
+    case BuzzerMode::CHIRP_SOS: {
+      // Triple urgent beep: 3x (120ms ON, 80ms OFF)
+      if (elapsed < 120 || (elapsed >= 200 && elapsed < 320) || (elapsed >= 400 && elapsed < 520)) {
+        digitalWrite(Config::BUZZER_PIN, HIGH);
+      } else if (elapsed >= 520) {
+        digitalWrite(Config::BUZZER_PIN, LOW);
+        buzzerMode = BuzzerMode::SILENT;
+      } else {
+        digitalWrite(Config::BUZZER_PIN, LOW);
+      }
+      break;
     }
-
-    return triggered;
+  }
 }
 
 // ============================================================
-// Create unique event ID
+// Event ID Generator (Monotonic & Persistent)
 // ============================================================
+String generateEventId() {
+  eventSeq++;
+  prefs.putUInt("seq", eventSeq);
 
-String createEventId() {
+  uint64_t chipId = ESP.getEfuseMac();
+  uint16_t mac4 = (uint16_t)(chipId & 0xFFFF);
 
-    uint64_t chipId = ESP.getEfuseMac();
-
-    char buffer[40];
-
-    snprintf(
-        buffer,
-        sizeof(buffer),
-        "%08lX-%lu",
-        (unsigned long)(chipId & 0xFFFFFFFFULL),
-        (unsigned long)millis()
-    );
-
-    return String(buffer);
+  char buffer[32];
+  snprintf(buffer, sizeof(buffer), "%04X-%u-%lu", mac4, (unsigned int)bootCount, (unsigned long)eventSeq);
+  return String(buffer);
 }
 
 // ============================================================
-// Send ACCIDENT BLE notification
+// Button Debounce & Long-Press SOS Handler
 // ============================================================
+static unsigned long buttonPressStart = 0;
+static bool buttonWasDown = false;
+static bool sosTriggeredForCurrentPress = false;
 
-void sendAccidentEvent() {
+void handleButton() {
+  bool isDown = (digitalRead(Config::MANUAL_BUTTON_PIN) == LOW);
+  unsigned long now = millis();
 
-    if (eventCharacteristic == nullptr) {
+  if (isDown) {
+    if (!buttonWasDown) {
+      // Just pressed
+      buttonPressStart = now;
+      buttonWasDown = true;
+      sosTriggeredForCurrentPress = false;
+    } else {
+      // Held down
+      unsigned long duration = now - buttonPressStart;
 
-        Serial.println("BLE ERROR: characteristic unavailable");
+      // In IDLE state, a 2.5s hold triggers MANUAL SOS
+      if (state == SystemState::IDLE && !sosTriggeredForCurrentPress && duration >= Config::SOS_LONG_PRESS_MS) {
+        sosTriggeredForCurrentPress = true;
+        setBuzzerMode(BuzzerMode::CHIRP_SOS);
 
-        return;
+        activeEventId = generateEventId();
+        Serial.println();
+        Serial.println("========================================");
+        Serial.printf("MANUAL SOS TRIGGERED (Event: %s)\n", activeEventId.c_str());
+        Serial.println("========================================");
+        Serial.println();
+
+        ble.sendEmergency("MANUAL_SOS", activeEventId);
+      }
     }
+  } else {
+    // Released
+    if (buttonWasDown) {
+      unsigned long duration = now - buttonPressStart;
+      buttonWasDown = false;
 
-    currentEventId = createEventId();
+      // Short press (> debounce ms and not already handled as long press)
+      if (duration >= Config::BUTTON_DEBOUNCE_MS && !sosTriggeredForCurrentPress) {
+        if (state == SystemState::ACCIDENT_COUNTDOWN) {
+          // CANCEL COUNTDOWN
+          state = SystemState::IDLE;
+          setBuzzerMode(BuzzerMode::CHIRP_CANCEL);
+          sensors.clear();
+          ble.sendEmergency("CANCEL", activeEventId);
 
-    StaticJsonDocument<256> document;
-
-    document["version"] = 1;
-    document["type"] = "ACCIDENT";
-    document["event_id"] = currentEventId;
-
-    // ESP32 uptime timestamp.
-    // The Android application uses the phone/GPS time for the
-    // actual emergency message.
-    document["timestamp"] = (unsigned long)millis();
-
-    String payload;
-
-    serializeJson(document, payload);
-
-    // Store the complete JSON in the characteristic.
-    eventCharacteristic->setValue(payload);
-
-    // Send exactly one notification for this accident.
-    eventCharacteristic->notify();
-
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("BLE ACCIDENT EVENT SENT");
-    Serial.println(payload);
-    Serial.println("================================");
-    Serial.println();
-}
-
-// ============================================================
-// BLE setup
-// ============================================================
-
-void setupBLE() {
-
-    Serial.println();
-    Serial.println("Starting SafeHelm BLE...");
-
-    NimBLEDevice::init(DEVICE_NAME);
-
-    // Important:
-    // Android previously received only the first ~20 bytes when
-    // the default ATT MTU was used.
-    //
-    // Request/use a larger MTU so the complete JSON notification
-    // can be delivered.
-    NimBLEDevice::setMTU(247);
-
-    NimBLEServer* server = NimBLEDevice::createServer();
-
-    NimBLEService* service =
-        server->createService(SERVICE_UUID);
-
-    eventCharacteristic =
-        service->createCharacteristic(
-            CHARACTERISTIC_UUID,
-            NIMBLE_PROPERTY::READ |
-            NIMBLE_PROPERTY::WRITE |
-            NIMBLE_PROPERTY::NOTIFY
-        );
-
-    // Initial value.
-    eventCharacteristic->setValue("{}");
-
-    service->start();
-
-    NimBLEAdvertising* advertising =
-        NimBLEDevice::getAdvertising();
-
-    advertising->addServiceUUID(SERVICE_UUID);
-
-    // Allow the phone to see the device name in scan response.
-    advertising->setScanResponse(true);
-
-    NimBLEDevice::startAdvertising();
-
-    Serial.println("BLE READY");
-    Serial.print("Device: ");
-    Serial.println(DEVICE_NAME);
-
-    Serial.print("Service UUID: ");
-    Serial.println(SERVICE_UUID);
-
-    Serial.print("Characteristic UUID: ");
-    Serial.println(CHARACTERISTIC_UUID);
-
-    Serial.println("BLE ADVERTISING");
-    Serial.println();
+          Serial.println();
+          Serial.println("========================================");
+          Serial.println("ACCIDENT CANCELLED BY HELMET BUTTON");
+          Serial.println("Countdown aborted. Notified companion app.");
+          Serial.println("========================================");
+          Serial.println();
+        }
+      }
+    }
+  }
 }
 
 // ============================================================
 // Setup
 // ============================================================
-
 void setup() {
+  Serial.begin(115200);
 
-    Serial.begin(115200);
+  // Hardware Pins
+  pinMode(Config::BUZZER_PIN, OUTPUT);
+  digitalWrite(Config::BUZZER_PIN, LOW);
+  pinMode(Config::MANUAL_BUTTON_PIN, INPUT_PULLUP);
 
-    // Buzzer OFF at startup.
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
+  // NVS Setup for monotonic IDs
+  prefs.begin("safehelm", false);
+  bootCount = prefs.getUInt("boot", 0) + 1;
+  prefs.putUInt("boot", bootCount);
+  eventSeq = prefs.getUInt("seq", 0);
 
-    // Cancel button:
-    // pressed = LOW
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Initialize sensors and BLE
+  sensors.begin();
+  ble.begin();
 
-    // ESP32 ADC resolution.
-    analogReadResolution(12);
-
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("SAFEHELM ACCIDENT SYSTEM");
-    Serial.println("================================");
-
-    Serial.println("FSR1 = GPIO36");
-    Serial.println("FSR2 = GPIO39");
-    Serial.println("FSR3 = GPIO34");
-    Serial.println("BUZZER = GPIO12");
-    Serial.println("BUTTON = GPIO13");
-
-    Serial.print("FSR threshold = ");
-    Serial.println(FSR_THRESHOLD);
-
-    Serial.print("Confirmation time = ");
-    Serial.print(CONFIRM_TIME_MS);
-    Serial.println(" ms");
-
-    Serial.print("Cancellation time = ");
-    Serial.print(CANCEL_TIME_MS);
-    Serial.println(" ms");
-
-    setupBLE();
-
-    Serial.println("SYSTEM READY");
-    Serial.println();
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("SAFEHELM HARDENED FIRMWARE READY");
+  Serial.printf("Device: %s (Boot #%u, LastSeq #%lu)\n",
+                Config::DEVICE_NAME, bootCount, (unsigned long)eventSeq);
+  Serial.println("========================================");
+  Serial.println();
 }
 
 // ============================================================
-// Main loop
+// Main Loop
 // ============================================================
-
 void loop() {
+  unsigned long now = millis();
 
-    int v1;
-    int v2;
-    int v3;
+  // 1. Update sensors
+  sensors.update();
 
-    int triggered =
-        readTriggeredSensors(v1, v2, v3);
+  // 2. Handle button (cancel / SOS)
+  handleButton();
 
-    unsigned long now = millis();
+  // 3. Handle remote cancel from companion phone over BLE
+  if (ble.isCancelRequested() && state == SystemState::ACCIDENT_COUNTDOWN) {
+    state = SystemState::IDLE;
+    setBuzzerMode(BuzzerMode::CHIRP_CANCEL);
+    sensors.clear();
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("ACCIDENT CANCELLED REMOTELY BY PHONE APP");
+    Serial.println("Countdown aborted. System returned to IDLE.");
+    Serial.println("========================================");
+    Serial.println();
+  }
 
-    // ========================================================
-    // NORMAL STATE
-    // ========================================================
+  // 4. Retry unacknowledged BLE emergency packets (3x every 2s)
+  ble.retry();
 
-    if (!accidentPending && !accidentLocked) {
+  // 5. Update buzzer pattern
+  updateBuzzer();
 
-        digitalWrite(BUZZER_PIN, LOW);
+  // 6. State Machine
+  switch (state) {
+    case SystemState::IDLE: {
+      if (sensors.confirmed()) {
+        state = SystemState::ACCIDENT_COUNTDOWN;
+        countdownStartTime = now;
+        activeEventId = generateEventId();
+        setBuzzerMode(BuzzerMode::PULSING_COUNTDOWN);
 
-        // At least 2 of the 3 FSRs must exceed threshold.
-        if (triggered >= 2) {
+        // UNIFIED COUNTDOWN: Notify companion phone IMMEDIATELY upon crash confirmation
+        ble.sendEmergency("ACCIDENT", activeEventId);
 
-            // Start persistence timer.
-            if (conditionStartTime == 0) {
-
-                conditionStartTime = now;
-
-                Serial.println(
-                    "ACCIDENT CONDITION DETECTED"
-                );
-            }
-
-            // Condition remained valid for 300 ms.
-            else if (
-                now - conditionStartTime >=
-                CONFIRM_TIME_MS
-            ) {
-
-                accidentPending = true;
-
-                accidentStartTime = now;
-
-                digitalWrite(BUZZER_PIN, HIGH);
-
-                Serial.println();
-                Serial.println("================================");
-                Serial.println("ACCIDENT CONDITION CONFIRMED");
-                Serial.println("15 SECOND CANCEL PERIOD STARTED");
-                Serial.println("PRESS BUTTON TO CANCEL");
-                Serial.println("================================");
-
-                // IMPORTANT:
-                // DO NOT send BLE yet.
-                //
-                // BLE emergency notification is sent ONLY
-                // after the complete 15-second cancellation
-                // period expires.
-            }
-        }
-
-        else {
-
-            // Condition disappeared before 300 ms.
-            conditionStartTime = 0;
-        }
+        Serial.println();
+        Serial.println("========================================");
+        Serial.println("CRASH CONDITION CONFIRMED (2+ FSRs > 150)");
+        Serial.printf("STARTING UNIFIED 15-SECOND COUNTDOWN (Event: %s)\n", activeEventId.c_str());
+        Serial.println("Press helmet button or cancel in companion app.");
+        Serial.println("========================================");
+        Serial.println();
+      }
+      break;
     }
 
-    // ========================================================
-    // ACCIDENT PENDING
-    // ========================================================
+    case SystemState::ACCIDENT_COUNTDOWN: {
+      if (now - countdownStartTime >= Config::CANCELLATION_MS) {
+        // 15 seconds elapsed without rider aborting on either device
+        state = SystemState::ACCIDENT_LOCKED;
+        setBuzzerMode(BuzzerMode::SILENT);
 
-    if (accidentPending) {
-
-        // Keep buzzer ON throughout the 15-second window.
-        digitalWrite(BUZZER_PIN, HIGH);
-
-        // ----------------------------------------------------
-        // CANCEL BUTTON
-        // ----------------------------------------------------
-
-        if (digitalRead(BUTTON_PIN) == LOW) {
-
-            accidentPending = false;
-
-            accidentLocked = false;
-
-            conditionStartTime = 0;
-
-            digitalWrite(BUZZER_PIN, LOW);
-
-            Serial.println();
-            Serial.println("================================");
-            Serial.println("ACCIDENT CANCELLED BY BUTTON");
-            Serial.println("SYSTEM RETURNED TO NORMAL");
-            Serial.println("================================");
-            Serial.println();
-        }
-
-        // ----------------------------------------------------
-        // 15 SECONDS EXPIRED
-        // ----------------------------------------------------
-
-        else if (
-            now - accidentStartTime >=
-            CANCEL_TIME_MS
-        ) {
-
-            // Stop buzzer.
-            digitalWrite(BUZZER_PIN, LOW);
-
-            // Leave pending state.
-            accidentPending = false;
-
-            // Lock until sensors are released.
-            accidentLocked = true;
-
-            Serial.println();
-            Serial.println("================================");
-            Serial.println("ACCIDENT CONFIRMED");
-            Serial.println("15 SECOND PERIOD EXPIRED");
-            Serial.println("SENDING BLE EMERGENCY EVENT");
-            Serial.println("================================");
-
-            // THIS is the important mobile-alert command.
-            sendAccidentEvent();
-        }
+        Serial.println();
+        Serial.println("========================================");
+        Serial.printf("COUNTDOWN EXPIRED (Event: %s)\n", activeEventId.c_str());
+        Serial.println("System locked. Companion phone dispatches emergency alerts.");
+        Serial.println("========================================");
+        Serial.println();
+      }
+      break;
     }
 
-    // ========================================================
-    // ACCIDENT LOCK / RE-ARM
-    // ========================================================
-
-    if (accidentLocked) {
-
-        // Do not allow another event while 2+ sensors
-        // are still above threshold.
-        if (triggered < 2) {
-
-            accidentLocked = false;
-
-            conditionStartTime = 0;
-
-            Serial.println("SYSTEM RE-ARMED");
-            Serial.println();
-        }
+    case SystemState::ACCIDENT_LOCKED: {
+      // Re-arm only after force sensors return below threshold
+      if (sensors.belowThreshold()) {
+        state = SystemState::IDLE;
+        sensors.clear();
+        Serial.println("[SAFEHELM] Sensors returned to normal. System re-armed.");
+      }
+      break;
     }
+  }
 
-    // ========================================================
-    // DEBUG OUTPUT
-    // ========================================================
 
-    static unsigned long lastDebugTime = 0;
+  // Debug output every 500ms
+  static unsigned long lastDebugTime = 0;
+  if (now - lastDebugTime >= 500) {
+    lastDebugTime = now;
+    uint16_t l, r, c;
+    sensors.getValues(l, r, c);
+    Serial.printf("[STATUS] L:%u R:%u C:%u | Trig:%u | State:%d | BLE:%s | Ack:%s\n",
+                  l, r, c,
+                  sensors.getTriggeredCount(),
+                  (int)state,
+                  ble.isConnected() ? "CONNECTED" : "ADVERTISING",
+                  ble.acknowledged() ? "YES" : "WAITING");
+  }
 
-    if (now - lastDebugTime >= 250) {
-
-        lastDebugTime = now;
-
-        Serial.print("FSR1=");
-        Serial.print(v1);
-
-        Serial.print("  FSR2=");
-        Serial.print(v2);
-
-        Serial.print("  FSR3=");
-        Serial.print(v3);
-
-        Serial.print("  TRIGGERED=");
-        Serial.print(triggered);
-
-        Serial.print("  PENDING=");
-        Serial.print(accidentPending ? 1 : 0);
-
-        Serial.print("  LOCKED=");
-        Serial.println(accidentLocked ? 1 : 0);
-    }
-
-    // Non-blocking sensor loop.
-    delay(20);
+  delay(10);
 }

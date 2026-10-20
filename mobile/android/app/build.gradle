@@ -29,3 +29,8 @@ android {
 flutter {
     source '../..'
 }
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.xerial:sqlite-jdbc:3.45.1.0'
+}

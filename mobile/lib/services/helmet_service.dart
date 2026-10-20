@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/services.dart';
@@ -7,15 +7,22 @@ import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../core/protocol.dart';
 import '../models/helmet_event.dart';
+import 'foreground_service.dart';
+import 'storage.dart';
 
 enum HelmetConnection { disconnected, scanning, connecting, connected, error }
+
+
 
 abstract class HelmetService {
   Stream<HelmetConnection> get connection;
   Stream<HelmetEvent> get events;
+  String? get connectedDeviceName;
   Future<List<ScanResult>> scan();
-  Future<void> connect(ScanResult result);
+  Future<void> connect(ScanResult result, {Storage? storage});
+  Future<bool> reconnect(Storage storage);
   Future<void> disconnect();
+  Future<void> cancelAlert(String id);
 }
 
 class BleHelmetService implements HelmetService {
@@ -23,6 +30,11 @@ class BleHelmetService implements HelmetService {
   final _events = StreamController<HelmetEvent>.broadcast();
   BluetoothDevice? _device;
   BluetoothCharacteristic? _characteristic;
+  String? _connectedName;
+
+  @override
+  String? get connectedDeviceName => _connectedName;
+
 
   BleHelmetService() {
     FlutterBluePlus.adapterState.listen((s) {
@@ -143,7 +155,7 @@ class BleHelmetService implements HelmetService {
   }
 
   @override
-  Future<void> connect(ScanResult result) async {
+  Future<void> connect(ScanResult result, {Storage? storage}) async {
     try {
       await _checkConnectPermissions();
       _connection.add(HelmetConnection.connecting);
@@ -151,6 +163,7 @@ class BleHelmetService implements HelmetService {
       await _device!.connect(timeout: const Duration(seconds: 12));
       _device!.connectionState.listen((s) {
         if (s == BluetoothConnectionState.disconnected) {
+          _connectedName = null;
           _connection.add(HelmetConnection.disconnected);
         }
       });
@@ -177,10 +190,39 @@ class BleHelmetService implements HelmetService {
         _events.add(event);
       });
       _connection.add(HelmetConnection.connected);
+      final devName = result.advertisementData.advName.isNotEmpty
+          ? result.advertisementData.advName
+          : (result.device.platformName.isNotEmpty
+              ? result.device.platformName
+              : 'SafeHelm Helmet');
+      _connectedName = devName;
+      if (storage != null) {
+        unawaited(storage.saveLastHelmet(result.device.remoteId.str, devName));
+      }
+      unawaited(SafeHelmForegroundService.start(
+        status: 'SafeHelm Active — Connected to $devName',
+      ));
     } catch (_) {
+      _connectedName = null;
       _connection.add(HelmetConnection.error);
       rethrow;
     }
+  }
+
+  @override
+  Future<bool> reconnect(Storage storage) async {
+    final targetId = storage.getLastHelmetId();
+    if (targetId == null || targetId.isEmpty) return false;
+    try {
+      final results = await scan();
+      final match = results.where((r) => r.device.remoteId.str == targetId).firstOrNull ??
+          results.where((r) => r.device.platformName.startsWith(safeHelmNamePrefix)).firstOrNull;
+      if (match != null) {
+        await connect(match, storage: storage);
+        return true;
+      }
+    } catch (_) {}
+    return false;
   }
 
   Future<void> _ack(String id) =>
@@ -191,7 +233,17 @@ class BleHelmetService implements HelmetService {
       Future.value();
 
   @override
+  Future<void> cancelAlert(String id) =>
+      _characteristic?.write(
+        utf8.encode(jsonEncode({'version': 1, 'type': 'CANCEL', 'event_id': id})),
+        withoutResponse: false,
+      ) ??
+      Future.value();
+
+  @override
   Future<void> disconnect() async {
+    _connectedName = null;
+    unawaited(SafeHelmForegroundService.stop());
     await _device?.disconnect();
     _connection.add(HelmetConnection.disconnected);
   }
@@ -205,15 +257,25 @@ class SimulatedHelmetService implements HelmetService {
   @override
   Stream<HelmetEvent> get events => _events.stream;
   @override
+  String? get connectedDeviceName => 'Simulated SafeHelm Helmet';
+  @override
   Future<List<ScanResult>> scan() async => [];
   @override
-  Future<void> connect(ScanResult r) async =>
+  Future<void> connect(ScanResult r, {Storage? storage}) async =>
       _connection.add(HelmetConnection.connected);
+  @override
+  Future<bool> reconnect(Storage storage) async {
+    _connection.add(HelmetConnection.connected);
+    return true;
+  }
   @override
   Future<void> disconnect() async =>
       _connection.add(HelmetConnection.disconnected);
+  @override
+  Future<void> cancelAlert(String id) async {}
   void simulate(HelmetEvent e) => _events.add(e);
 }
+
 
 // Real BLE is the default in both debug and release builds. The simulator is only
 // reachable when a developer explicitly injects SimulatedHelmetService in a test.
