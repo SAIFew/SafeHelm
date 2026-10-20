@@ -1,0 +1,7 @@
+#include "BleServer.h"
+void BleServer::begin(){NimBLEDevice::init(Config::DEVICE_NAME);auto*s=NimBLEDevice::createServer()->createService(Config::SERVICE_UUID);event_=s->createCharacteristic(Config::EVENT_UUID,NIMBLE_PROPERTY::NOTIFY|NIMBLE_PROPERTY::WRITE);event_->setCallbacks(this);s->start();auto*a=NimBLEDevice::getAdvertising();a->addServiceUUID(Config::SERVICE_UUID);a->start();}
+void BleServer::notify(const String&p){event_->setValue(p.c_str());event_->notify();}
+void BleServer::sendEmergency(const char*type,const String&id){StaticJsonDocument<180>d;d["version"]=1;d["type"]=type;d["event_id"]=id;d["timestamp"]=millis()/1000;serializeJson(d,pendingPayload_);pendingId_=id;acknowledged_=false;attempts_=0;lastSent_=0;retry();}
+void BleServer::sendStatus(){StaticJsonDocument<120>d;d["version"]=1;d["type"]="STATUS";d["device_id"]=Config::DEVICE_NAME;String p;serializeJson(d,p);notify(p);}
+void BleServer::retry(){if(acknowledged_||attempts_>=3||millis()-lastSent_<2000)return;notify(pendingPayload_);attempts_++;lastSent_=millis();}
+void BleServer::onWrite(NimBLECharacteristic*c){StaticJsonDocument<160>d;const std::string value=c->getValue();if(deserializeJson(d,value.c_str()))return;if(d["version"]!=1)return;const char*t=d["type"]|"";const char*id=d["event_id"]|"";if(!strcmp(t,"ACK") && String(id)==pendingId_)acknowledged_=true;if(!strcmp(t,"PING")){StaticJsonDocument<64>p;p["version"]=1;p["type"]="PONG";String s;serializeJson(p,s);notify(s);}}
